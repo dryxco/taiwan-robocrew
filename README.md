@@ -27,7 +27,6 @@ Open `http://localhost:5173`. Other devices on the same network can use the host
 
 Open a stall and press **Start scripted demo**. This resets that simulated order and runs its steps automatically. Webcam images can be displayed for performance; hand tracking is **not required** for the scripted routine. Keep the scripted-demo label visible. **Stop scripted demo** holds motion. Connection and video freshness checks remain active.
 
-See [the two-minute recording script](docs/DEMO.md) for English narration and Korean stage directions.
 
 ## What is implemented
 

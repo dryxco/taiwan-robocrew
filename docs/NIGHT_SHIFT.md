@@ -40,7 +40,7 @@ The design handoff is AUTO → SAFE_HOLD → REMOTE → VERIFYING → AUTO. Futu
 
 ## Current demonstration
 
-The recording is **two minutes**, superseding the original 90-second proposal. See DEMO.md for the shot list.
+The recording is **two minutes**, superseding the original 90-second proposal.
 
 The current recording mode uses explicit scripted actions. The operator performs hand movements for the camera, but those movements do not drive scripted mode. Start scripted demo resets the current simulated order and advances the task through checked states. Connection/video freshness checks remain. The screen identifies scripted operation.
 
