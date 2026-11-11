@@ -89,7 +89,7 @@ def augment_scene(xml: str) -> str:
             finger = ET.SubElement(tcp, 'body', name=f'{side}_finger{index}', pos=f'{sign*.055} 0 -.035')
             name = f'{side}_finger{index}_slide'
             ET.SubElement(finger, 'joint', name=name, type='slide', axis=f'{-sign} 0 0', range='0 .035', damping='2')
-            ET.SubElement(finger, 'geom', type='box', size='.006 .014 .025', mass='.02', rgba='.18 .20 .22 1', contype='0', conaffinity='0')
+            ET.SubElement(finger, 'geom', type='box', size='.006 .014 .025', mass='.02', rgba='0 0 0 0', contype='0', conaffinity='0')
             ET.SubElement(actuator, 'position', name=name+'_servo', joint=name, kp='200', kv='5', ctrlrange='0 .035', forcerange='-2 2')
         if side == 'left' and wrist is not None:
             tcp.append(wrist)
@@ -150,6 +150,7 @@ class HumanoidController(DualYamController):
         self.reset()
 
     def reset(self, target_position=None):
+        self._solution_cache = {}
         if target_position is not None:
             self.targets['left'] = np.asarray(target_position, dtype=float).copy()
         for side, arm in self.arms.items():
@@ -204,8 +205,24 @@ class HumanoidController(DualYamController):
             self.held = False
             for side, arm in self.arms.items():
                 self.targets[side] = targets[side]
-                q, error = self.solve(side, targets[side], self.commands[side], 80,
-                                      orientation=orientations[side])
+                cache = getattr(self, '_solution_cache', {})
+                key = tuple(targets[side]) + (() if orientations[side] is None else tuple(orientations[side]))
+                saved = cache.get(side)
+                if saved is not None and saved[0] == key:
+                    q, error, angle = saved[1:]
+                    self.orientation_errors[side] = angle
+                else:
+                    q, error = self.solve(side, targets[side], self.commands[side], 80,
+                                          orientation=orientations[side])
+                    if error >= .015 or self.orientation_errors[side] >= .12:
+                        # A straight Cartesian path can cross a local IK minimum.
+                        # Try the calibrated neutral seed; retain the same acceptance limits.
+                        seed = [-.6, .2 if side == 'left' else -.2, 0, 1., 0, 0, 0]
+                        alternative, alternative_error = self.solve(side, targets[side], seed, 240,
+                                                                   orientation=orientations[side])
+                        q, error = alternative, alternative_error
+                    cache[side] = (key, q.copy(), error, self.orientation_errors[side])
+                    self._solution_cache = cache
                 self.ik_errors[side] = error
                 self.rejected[side] = error >= .015 or self.orientation_errors[side] >= .12
                 if self.rejected[side]:

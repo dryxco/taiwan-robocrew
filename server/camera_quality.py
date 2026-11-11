@@ -59,7 +59,7 @@ class CameraQuality:
     def for_camera(self, camera: str) -> CameraProfile:
         if camera == 'first_person':
             return self.first_person
-        if camera in ('top', 'wrist'):
+        if camera in ('top', 'wrist', 'operator'):
             return self.secondary
         raise ValueError(f'Unknown camera: {camera}')
 

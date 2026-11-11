@@ -21,12 +21,16 @@ export class HandIntentProcessor {
   private direction = 0;
   private reversals: number[] = [];
   private lastShake = -Infinity;
+  private pendingPinch = false;
+  private pinchSince = -Infinity;
 
   lost(): HandIntent {
     this.value = { ...this.value, pinch: false, shake: false, confidence: 0, tracked: false };
     this.direction = 0;
     this.reversals = [];
     this.lastTime = -Infinity;
+    this.pendingPinch = false;
+    this.pinchSince = -Infinity;
     return { ...this.value };
   }
 
@@ -44,14 +48,25 @@ export class HandIntentProcessor {
     const size = Math.max(distance(points[0], points[9]), distance(points[5], points[17]));
     if (size < 0.025) return this.lost();
     const ratio = distance(points[4], points[8]) / size;
-    const pinch = ratio < (this.value.pinch ? 0.48 : 0.30);
-    // Mirror the index fingertip exactly as the preview is mirrored.
-    const rawX = clamp(1 - points[8].x);
-    const rawY = clamp(points[8].y);
+    // Require a sustained gesture; one noisy frame must never release a held object.
+    const candidate = this.value.pinch ? ratio < 0.58 : ratio < 0.34;
+    if (candidate !== this.pendingPinch) { this.pendingPinch = candidate; this.pinchSince = now; }
+    let pinch = this.value.pinch;
+    if (candidate !== pinch && now - this.pinchSince >= 100) pinch = candidate;
+    // Palm center stays still when fingers close; fingertip steering caused grasp-time jumps.
+    const rawX = clamp(1 - (points[0].x + points[5].x + points[9].x + points[17].x) / 4);
+    const rawY = clamp((points[0].y + points[5].y + points[9].y + points[17].y) / 4);
     const wasTracked = this.value.tracked;
-    const alpha = wasTracked ? 1 - Math.exp(-(now - this.lastTime) / 65) : 1;
-    const x = this.value.x + alpha * (rawX - this.value.x);
-    const y = this.value.y + alpha * (rawY - this.value.y);
+    const dt = wasTracked ? Math.min(100, now - this.lastTime) : 40;
+    const alpha = 1 - Math.exp(-dt / 130);
+    const smooth = (previous: number, raw: number) => {
+      if (!wasTracked) return raw;
+      const delta = raw - previous;
+      if (Math.abs(delta) < .009) return previous;
+      return previous + Math.max(-.6 * dt / 1000, Math.min(.6 * dt / 1000, alpha * delta));
+    };
+    const x = smooth(this.value.x, rawX);
+    const y = smooth(this.value.y, rawY);
     // Shake uses palm movement, not fingertip motion during a pinch.
     const palmX = 1 - (points[0].x + points[5].x + points[9].x + points[17].x) / 4;
     if (!wasTracked) this.turnX = palmX;

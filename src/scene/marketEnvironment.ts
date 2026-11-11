@@ -17,7 +17,7 @@ export interface MarketEnvironment {
 }
 
 /** Original procedural art. Metres, Y-up; stall fronts face +Z. Call once per scene. */
-export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
+export function buildMarketEnvironment(scene: THREE.Scene, activeWorkstation?: MarketStallId): MarketEnvironment {
   const group = new THREE.Group();
   group.name = 'taiwan-night-market';
   scene.add(group);
@@ -133,8 +133,8 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
   for (const s of specs) {
     const p = new THREE.Group(); p.name = `stall-${s.id}`; p.userData.stallId = s.id; p.position.set(s.x, 0, -3); group.add(p);
     stalls[s.id] = { position: p.position.clone(), approach: new THREE.Vector3(s.x, 1.65, 0.6), counter: new THREE.Vector3(s.x, 1.1, -1.85) };
-    box(p, 0, 0.54, 0.8, 3.35, 1.02, 0.82, s.color);
-    box(p, 0, 1.07, 0.8, 3.5, 0.1, 1.02, '#b7b7ac', 0, 0.65);
+    box(p, 0, s.id===activeWorkstation?.45:.54, .8, 3.35, s.id===activeWorkstation?.9:1.02, .82, s.color);
+    if(s.id!==activeWorkstation) box(p, 0, 1.07, 0.8, 3.5, 0.1, 1.02, '#b7b7ac', 0, 0.65);
     for (const x of [-1.65, 1.65]) for (const z of [-0.9, 1.35]) box(p, x, 1.42, z, 0.075, 2.84, 0.075, '#a5a19a', 0, 0.5);
     box(p, 0, 1.1, -0.85, 3.3, 0.08, 0.5, '#8a8c88', 0, 0.6);
     for (let i = 0; i < 12; i++) {
@@ -153,7 +153,7 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
     lantern(s.x - 1.4, 2.32, -1.3); lantern(s.x + 1.4, 2.32, -1.3);
     // Rear shelving and crates establish usable workspace behind each counter.
     for (let j = 0; j < 4; j++) { box(p, -1.1 + j * 0.7, 0.23, -0.6, 0.58, 0.42, 0.45, j % 2 ? '#44685f' : '#976444'); for (let k = 0; k < 3; k++) box(p, -1.1 + j * 0.7, 0.12 + k * 0.1, -0.365, 0.5, 0.025, 0.02, '#2d3c39'); }
-    if (s.id === 'jipai') {
+    if (s.id === activeWorkstation) { /* Live MuJoCo fixtures replace decorative food here. */ } else if (s.id === 'jipai') {
       box(p, -0.52, 1.22, 0.45, 0.92, 0.25, 0.7, '#5d6467', 0, 0.6);
       box(p, -0.52, 1.355, 0.45, 0.76, 0.02, 0.55, '#9d591c', 0.25);
       for (let j = 0; j < 8; j++) box(p, -0.85 + j * 0.095, 1.38, 0.44, 0.013, 0.02, 0.52, '#c3bca7', 0, 0.65);
@@ -249,7 +249,7 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
 
   // Eight instanced body-part draws for the entire crowd. Reuse geometry/materials;
   // add after static batching so animated instance matrices are never baked away.
-  const crowdCount = 36; // 20 walkers, 9 queued customers, 4 diners, 3 vendors.
+  const crowdCount = 33; // 20 walkers, 9 queued customers, 4 diners; G1 chefs render separately.
   const humanBox = new THREE.BoxGeometry(1, 1, 1);
   const humanHead = new THREE.SphereGeometry(1, 8, 6);
   geometries.add(humanBox); geometries.add(humanHead);
@@ -288,8 +288,10 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
   const updateCrowd = (seconds: number) => {
     crowdTime = seconds;
     for (let i = 0; i < 20; i++) {
-      const direction = i % 2 ? 1 : -1;
-      const progress = ((seconds * (0.35 + i % 4 * 0.055) + i * 1.77) % 21 + 21) % 21;
+      const lane = i % 4;
+      const direction = lane % 2 ? 1 : -1;
+      const slot = Math.floor(i / 4);
+      const progress = ((seconds * (0.35 + lane * 0.055) + slot * 4.2 + lane * 1.1) % 21 + 21) % 21;
       drawPerson(i, direction * (progress - 10.5), 3.4 + (i % 4) * 0.85, direction * Math.PI / 2, seconds * 4 + i, false, 0, i % 3 === 0);
     }
     for (let stall = 0; stall < 3; stall++) {
@@ -307,8 +309,6 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
       const x = i < 2 ? -7.1 : 7.1; const second = i % 2;
       drawPerson(29 + i, x + (second ? 0.4 : -0.65), second ? 2.2 : 1.7, second ? Math.PI : Math.PI / 2, 0, true, 1.0 + Math.sin(seconds * 1.7 + i) * 0.2, false);
     }
-    for (let i = 0; i < 3; i++) drawPerson(33 + i, specs[i].x + 0.2, -3.25, 0, 0, false,
-      (queues[i].stage === 'bag' || queues[i].stage === 'deliver' ? 1.2 : 0.7) + Math.sin(seconds * 3 + i) * 0.3, false);
     parts.forEach(part => { part.instanceMatrix.needsUpdate = true; });
   };
   updateCrowd(0);

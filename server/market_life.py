@@ -88,8 +88,10 @@ def update_market_life(model, data, elapsed, delivered, order_number):
             if departing:
                 departing_pos = (x, y)
         else:
-            x = ((elapsed * (.28 + i * .025) + i * 1.5) % 7) - 3.5
-            y = 3.5 + (i % 2) * .5
+            lane = (i - 3) % 2
+            slot = (i - 3) // 2
+            x = ((elapsed * (.35 + lane * .05) + slot * 3.5 + lane * 1.1) % 7) - 3.5
+            y = 3.5 + lane * .8
         data.mocap_pos[mocap] = (x, y, .012 * math.sin(elapsed * 4 + i))
     cash = model.body('market_life_cash_TEST').mocapid[0]
     bag = model.body('market_life_order_bag').mocapid[0]

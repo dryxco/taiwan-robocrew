@@ -261,3 +261,42 @@ def test_idle_lease_expiry_events_and_measured_metrics(world):
         command(world, 'alice', 'tea', 'claim', now=115.03)
     assert len(world.state()['events']) == 200
     assert world.state()['events'][-1]['reason'] == 'robot_busy'
+
+
+def test_hand_gestures_trigger_assistance_once_without_overwriting_path(world):
+    activate(world, 'hands', 'jipai')
+    robot = world.robots['jipai']
+    def gesture(closed, x=0):
+        hand = dict(tracked=True, pinch=closed, x=x, y=0)
+        return command(world, 'hands', 'jipai', 'control', hands=dict(left=hand, right=hand))
+    assert gesture(False) is None
+    assert robot.action is None and robot.direct_hands
+    assert gesture(True) is None
+    assert robot.action == 'pick' and not robot.direct_hands
+    target = robot.target.copy()
+    assert gesture(True, 1) is None
+    np.testing.assert_array_equal(robot.target, target)
+    # Holding the gesture across an assisted segment cannot chain stages.
+    robot.stage, robot.action = 'season', None
+    assert gesture(True) is None
+    assert robot.action is None
+    assert gesture(False) is None
+    assert gesture(True) is None
+    assert robot.action == 'season'
+    robot.stage, robot.action = 'bag', None
+    assert gesture(False) is None
+    assert robot.action == 'bag'
+
+
+def test_rehearsal_restart_requires_owner_and_does_not_reward(world):
+    activate(world, 'performer', 'pepper')
+    robot = world.robots['pepper']
+    assert command(world, 'other', 'pepper', 'rehearse') == 'lease_required'
+    robot.data.qpos[:3] = [30, 30, .03]
+    assert command(world, 'performer', 'pepper', 'rehearse') is None
+    assert robot.stage == 'pick' and not robot.lease.active
+    assert np.linalg.norm(robot.food[:2]) < 1
+    assert not world.ledger
+    assert command(world, 'performer', 'pepper', 'activate') is None
+    complete(world, 'performer', 'pepper')
+    assert robot.delivered

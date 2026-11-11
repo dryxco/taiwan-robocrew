@@ -231,8 +231,17 @@ class DualYamController:
                 (self.model.eq_obj1id[i] == food_id or self.model.eq_obj2id[i] == food_id)
                 for i in range(self.model.neq) if i != arm['weld'])
             tcp = self.data.body(f'{side}_tcp')
-            pickup = tcp.xpos + tcp.xmat.reshape(3, 3) @ np.array([0., 0, -.07])
+            pickup = tcp.xpos + tcp.xmat.reshape(3, 3) @ self.model.eq_data[arm['weld'], 3:6]
             if not occupied and np.linalg.norm(self.data.body('food').xpos - pickup) < .035:
+                # Capture the actual relative pose: enabling a grasp must not
+                # snap/rotate the food to a preconfigured pose through the hand.
+                food = self.data.body('food')
+                relative = tcp.xmat.reshape(3, 3).T @ (food.xpos - tcp.xpos)
+                inverse = tcp.xquat.copy(); inverse[1:] *= -1
+                relative_quat = np.empty(4)
+                mujoco.mju_mulQuat(relative_quat, inverse, food.xquat)
+                self.model.eq_data[arm['weld'], 3:6] = relative
+                self.model.eq_data[arm['weld'], 6:10] = relative_quat
                 self.data.eq_active[arm['weld']] = 1
         self.last_weld[side] = bool(self.data.eq_active[arm['weld']])
         return self.last_weld[side]

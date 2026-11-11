@@ -1,11 +1,18 @@
 import * as THREE from 'three';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import {addFoodDetail} from './foodDetail';
 
 type Vec3 = readonly [number, number, number];
+// All camera views share the immutable source meshes. A camera owns its clone.
+const sourceMeshes=new Map<string,Promise<THREE.BufferGeometry>>();
 export interface HumanoidGeom {
+  role?: string;
   name: string;
   type: string | number;
   mesh_url?: string;
+  texture_url?: string;
+  vertices?: number[];
+  faces?: number[];
   position: Vec3;
   /** MuJoCo world rotation, nine row-major entries. */
   rotation: readonly number[];
@@ -51,7 +58,10 @@ export function createMarketHumanoids(
   const loader = new STLLoader();
   const geometryCache = new Map<string, Promise<THREE.BufferGeometry>>();
   const geometries = new Set<THREE.BufferGeometry>();
+  const textures = new Map<string, THREE.Texture>();
+  const textureLoader = new THREE.TextureLoader();
   const materials = new Map<string, THREE.MeshStandardMaterial>();
+  const foodDetails: ReturnType<typeof addFoodDetail>[]=[];
   const rotation = new THREE.Matrix4();
   let disposed = false;
   let busy = false;
@@ -78,17 +88,22 @@ export function createMarketHumanoids(
     const type = typeof geom.type === 'number'
       ? ['plane', 'hfield', 'sphere', 'capsule', 'ellipsoid', 'cylinder', 'box', 'mesh'][geom.type]
       : geom.type.replace(/^mjGEOM_/i, '').toLowerCase();
-    const key = geom.mesh_url ? `mesh:${geom.mesh_url}` : `${type}:${geom.size.join(',')}`;
+    const key = geom.vertices ? 'procedural:'+geom.name : geom.mesh_url ? `mesh:${geom.mesh_url}` : `${type}:${geom.size.join(',')}`;
     const cached = geometryCache.get(key);
     if (cached) return cached;
     const pending = (async () => {
       let result: THREE.BufferGeometry;
-      if (geom.mesh_url) {
-        const response = await fetch(geom.mesh_url, { signal: abort.signal });
-        if (!response.ok) throw new Error(`STL ${response.status}: ${geom.mesh_url}`);
-        const bytes = await response.arrayBuffer();
-        if (disposed) throw new Error('G1 visual disposed');
-        result = loader.parse(bytes);
+      if(geom.vertices&&geom.faces){
+        result=new THREE.BufferGeometry();result.setAttribute('position',new THREE.Float32BufferAttribute(geom.vertices,3));result.setIndex(geom.faces);result.computeVertexNormals();
+        const uv:number[]=[];for(let i=0;i<geom.vertices.length;i+=3)uv.push(geom.vertices[i]/.13+.5,geom.vertices[i+1]/.09+.5);result.setAttribute('uv',new THREE.Float32BufferAttribute(uv,2));
+      } else if (geom.mesh_url) {
+        const url=geom.mesh_url;
+        let source=sourceMeshes.get(url);
+        if(!source){source=fetch(url).then(async response=>{
+          if(!response.ok)throw new Error(`STL ${response.status}: ${url}`);
+          return loader.parse(await response.arrayBuffer());
+        });sourceMeshes.set(url,source);source.catch(()=>sourceMeshes.delete(url));}
+        result=(await source).clone();
       } else {
         // These are actual MJCF geoms (e.g. hat), never substitute robot parts.
         const [x, y, z] = geom.size;
@@ -109,8 +124,8 @@ export function createMarketHumanoids(
     catch (error) { geometryCache.delete(key); throw error; }
   }
 
-  function material(rgba: HumanoidGeom['rgba']) {
-    const key = rgba.join(',');
+  function material(rgba: HumanoidGeom['rgba'], textureUrl?:string) {
+    const key = rgba.join(',')+(textureUrl||'');
     let result = materials.get(key);
     if (!result) {
       result = new THREE.MeshStandardMaterial({
@@ -119,6 +134,7 @@ export function createMarketHumanoids(
         opacity: rgba[3], transparent: rgba[3] < 1, depthWrite: rgba[3] >= 1,
         roughness: 0.65, metalness: 0.12,
       });
+      if(textureUrl){let tex=textures.get(textureUrl);if(!tex){tex=textureLoader.load(textureUrl);tex.colorSpace=THREE.SRGBColorSpace;textures.set(textureUrl,tex);}result.map=tex;result.color.set('#ffffff');result.metalness=0;result.roughness=.85;}
       materials.set(key, result);
     }
     return result;
@@ -130,7 +146,8 @@ export function createMarketHumanoids(
         signal: abort.signal, cache: 'no-store',
       });
       if (!response.ok) throw new Error(`Visual endpoint returned ${response.status}`);
-      const data = await response.json() as { geoms: HumanoidGeom[] };
+      const data = await response.json() as { geoms: HumanoidGeom[]; frame_timestamp?: number };
+      robot.root.userData.receivedStamp=data.frame_timestamp;
       if (disposed) return;
       if (!Array.isArray(data.geoms)) throw new Error('Visual endpoint missing geoms');
       // Load together so fingers and hat do not serialize dozens of STL requests.
@@ -142,12 +159,19 @@ export function createMarketHumanoids(
         present.add(key);
         let mesh = robot.meshes.get(key);
         if (!mesh) {
-          mesh = new THREE.Mesh(geo, material(geom.rgba));
+          mesh = new THREE.Mesh(geo, material(geom.rgba,geom.texture_url));
           mesh.name = geom.name;
+          mesh.userData.isHead = /head_link|chef_hat/.test((geom.mesh_url || "") + geom.name);
           mesh.castShadow = true; mesh.receiveShadow = true;
           robot.meshes.set(key, mesh); robot.world.add(mesh);
+          if(geom.role==='food'){
+            const detail=addFoodDetail(mesh,robot.placement.robotId,!!geom.texture_url);
+            foodDetails.push(detail);mesh.userData.foodMaterial=detail.material;
+          }
         }
-        mesh.geometry = geo; mesh.material = material(geom.rgba);
+        mesh.geometry = geo; mesh.material = mesh.userData.foodMaterial || material(geom.rgba,geom.texture_url);
+        if(geom.role==='food'&&robot.placement.robotId==='pepper')
+          mesh.userData.foodMaterial.color.set(geom.rgba[0]<.5?'#985825':'#ca914b');
         mesh.visible = geom.rgba[3] > 0;
         mesh.position.set(...geom.position);
         const r = geom.rotation;
@@ -157,6 +181,7 @@ export function createMarketHumanoids(
       for (const [key, mesh] of robot.meshes) {
         if (!present.has(key)) { mesh.removeFromParent(); robot.meshes.delete(key); }
       }
+      robot.root.userData.frameTimestamp = data.frame_timestamp || 0;
       delete robot.root.userData.visualError;
     } catch (error) {
       if (disposed) return;
@@ -167,13 +192,18 @@ export function createMarketHumanoids(
   }
 
   function update(_robots?: unknown) {
-    if (disposed || busy || performance.now() < nextPoll) return;
+    if (disposed || busy) return;
+    if(performance.now()<nextPoll){
+      if(timer!==undefined)clearTimeout(timer);
+      timer=setTimeout(update,Math.ceil(nextPoll-performance.now())+1);
+      return;
+    }
     if (timer !== undefined) clearTimeout(timer);
     busy = true;
     nextPoll = performance.now() + 200;
     void Promise.all(robots.map(refresh)).finally(() => {
       busy = false;
-      if (!disposed) timer = setTimeout(update, Math.max(0, nextPoll - performance.now()));
+      if (!disposed) timer = setTimeout(update, Math.max(1, Math.ceil(nextPoll - performance.now())));
     });
   }
   update();
@@ -187,7 +217,8 @@ export function createMarketHumanoids(
       group.removeFromParent();
       robots.forEach(robot => { robot.meshes.clear(); robot.world.clear(); });
       geometries.forEach(geo => geo.dispose()); geometries.clear();
-      materials.forEach(mat => mat.dispose()); materials.clear(); geometryCache.clear();
+      foodDetails.forEach(detail=>detail.dispose());
+      materials.forEach(mat => mat.dispose()); materials.clear(); textures.forEach(t=>t.dispose());textures.clear(); geometryCache.clear();
     },
   };
 }

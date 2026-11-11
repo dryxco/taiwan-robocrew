@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+*.log
+
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+
+# Download upstream ML/test data locally; do not vendor without individual notices.
+public/models/*.task
+tests/fixtures/
+tests/hand-detection.html
