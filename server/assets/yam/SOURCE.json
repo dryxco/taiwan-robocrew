@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/i2rt-robotics/i2rt",
+  "revision": "c8c29ce470410135ba71029f28cdcbac1c787f14",
+  "model": "i2rt/robot_models/arm/yam/v1/yam.xml",
+  "license": "MIT",
+  "scale": 1.0
+}
