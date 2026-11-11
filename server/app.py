@@ -29,14 +29,14 @@ def state():
 @app.get('/api/robots/{robot_id}/frame')
 def frame(robot_id: str, view: str = 'first_person'):
     world = app.state.world
-    with world.lock:
-        robot = world.robots.get(robot_id)
-        if not robot or view not in ('first_person', 'top', 'wrist'):
-            raise HTTPException(404, 'Unknown robot or camera')
+    robot = world.robots.get(robot_id)
+    if not robot or view not in ('first_person', 'top', 'wrist'):
+        raise HTTPException(404, 'Unknown robot or camera')
+    with robot.frame_lock:
         content = robot.frames.get(view)
         if content is None:
             raise HTTPException(503, robot.renderer_error or 'Camera warming up')
-        return Response(content, media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
+        return Response(content, media_type='image/jpeg', headers={'Cache-Control': 'no-store', 'X-Frame-Timestamp': str(robot.frame_timestamps[view])})
 
 
 @app.websocket('/ws/{worker_id}')
@@ -58,7 +58,7 @@ async def websocket(ws: WebSocket, worker_id: str):
 
     async def broadcast():
         while True:
-            await send({'type': 'state', 'state': world.state()})
+            await send({'type': 'state', 'state': await asyncio.to_thread(world.state)})
             await asyncio.sleep(.1)
 
     task = asyncio.create_task(broadcast())
@@ -69,15 +69,15 @@ async def websocket(ws: WebSocket, worker_id: str):
                 cmd = json.loads(raw)
                 if not isinstance(cmd, dict) or len(raw) > 4096:
                     raise ValueError('Invalid command')
-                error = world.command(worker_id, cmd)
+                error = await asyncio.to_thread(world.command, worker_id, cmd)
                 await send({'type': 'ack', 'seq': cmd.get('seq'), 'ok': error is None, 'error': error})
             except (ValueError, TypeError):
-                world.disconnect(worker_id, release=False, reason='invalid_message')
+                await asyncio.to_thread(world.disconnect, worker_id, release=False, reason='invalid_message')
                 await send({'type': 'ack', 'ok': False, 'error': 'invalid_message'})
     except WebSocketDisconnect:
         pass
     finally:
-        world.disconnect(worker_id)
+        await asyncio.to_thread(world.disconnect, worker_id)
         app.state.connections.discard(worker_id)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

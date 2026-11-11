@@ -1,6 +1,8 @@
 """Local P0 rigid-body shared-autonomy simulation, with no real-world actuation."""
 from __future__ import annotations
 import io
+import copy
+from collections import deque
 import math
 import threading
 import time
@@ -81,7 +83,18 @@ class Robot:
         self.seasoned = False
         self.bagged = False
         self.delivered = False
-        self.velocity = np.zeros(2)
+        self.lock = threading.RLock()
+        self.frame_lock = threading.Lock()
+        self.target = self.data.mocap_pos[self.gripper, :2].copy()
+        self.pinched = False
+        self.order_number = 1
+        self.frame_timestamp = 0
+        self.frame_timestamps = {}
+        self.error = None
+        self.render_model = None
+        self.render_data = None
+        self.food_geom = int(self.model.body('food').geomadr[0])
+        self.original_food_rgba = self.model.geom_rgba[self.food_geom].copy()
         self.frames = {}
         self.renderer_error = None
         self.renderer = None
@@ -93,7 +106,7 @@ class Robot:
     def hold(self, reason):
         self.lease.active = False
         self.lease.hold_reason = reason
-        self.velocity[:] = 0
+        self.target[:] = self.data.mocap_pos[self.gripper, :2]
         self.action = None
         self.phase = 0
         self.dwell = 0
@@ -113,10 +126,18 @@ class Robot:
                     self.stage = 'retrieve'
                     self.action = None
         if self.lease.active:
-            self.data.mocap_pos[self.gripper, :2] += self.velocity * dt * .3
-            self.data.mocap_pos[self.gripper, :2] = np.clip(self.data.mocap_pos[self.gripper, :2], [-.65, -.48], [.65, .48])
             if self.action:
                 self.auto_step(dt)
+                # Do not resume a stale hand target when the bounded action finishes.
+                self.target[:] = self.data.mocap_pos[self.gripper, :2]
+            else:
+                target = self.data.mocap_pos[self.gripper].copy()
+                target[:2] = np.clip(self.target, [-.65, -.48], [.65, .48])
+                self.move(target, dt)
+        if self.cooked:
+            self.model.geom_rgba[self.food_geom] = [.38, .14, .035, 1]
+        elif self.seasoned:
+            self.model.geom_rgba[self.food_geom] = [.88, .24, .055, 1]
         mujoco.mj_step(self.model, self.data)
 
     def auto_step(self, dt):
@@ -205,17 +226,65 @@ class Robot:
                     self.stage = 'complete'
                     self.action = None
 
+    @property
+    def order_id(self):
+        return f'order-{self.id}-{self.order_number}'
+
+    @property
+    def status(self):
+        if not self.lease.active:
+            return 'SAFE_HOLD'
+        if self.action == 'deliver' or self.delivered:
+            return 'VERIFYING'
+        return 'AUTO' if self.action else 'REMOTE'
+
+    def next_order(self):
+        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
+        self.model.geom_rgba[self.food_geom] = self.original_food_rgba
+        self.stage = 'pick'
+        self.action = None
+        self.phase = 0
+        self.dwell = self.cook_time = 0.0
+        self.attached = self.cooked = self.trayed = False
+        self.seasoned = self.bagged = self.delivered = False
+        self.pinched = False
+        self.order_number += 1
+        self.hold('activation_required')
+        with self.frame_lock:
+            self.frames = {}
+            self.frame_timestamps = {}
+            self.frame_timestamp = 0
+
     def render(self):
         if self.renderer_error:
             return
         try:
-            if self.renderer is None:
-                self.renderer = mujoco.Renderer(self.model, height=320, width=480)
+            # Rendering owns its model/data and GL context; only snapshot copying
+            # takes the physics lock, never GL calls or JPEG encoding.
+            if self.render_model is None:
+                with self.lock:
+                    self.render_model = copy.copy(self.model)
+                self.render_data = mujoco.MjData(self.render_model)
+                self.renderer = mujoco.Renderer(self.render_model, height=320, width=480)
+            with self.lock:
+                self.render_data = copy.copy(self.data)
+                self.render_model.geom_rgba[:] = self.model.geom_rgba
+                order_number = self.order_number
+                captured_at = int(time.time() * 1000)
+            frames = {}
             for camera in ('first_person', 'top', 'wrist'):
-                self.renderer.update_scene(self.data, camera=camera)
+                self.renderer.update_scene(self.render_data, camera=camera)
                 output = io.BytesIO()
                 Image.fromarray(self.renderer.render()).save(output, format='JPEG', quality=75)
-                self.frames[camera] = output.getvalue()
+                frames[camera] = output.getvalue()
+            with self.lock:
+                if order_number != self.order_number:
+                    return
+                with self.frame_lock:
+                    self.frames = frames
+                    self.frame_timestamp = captured_at
+                    self.frame_timestamps = dict.fromkeys(frames, self.frame_timestamp)
         except Exception as exc:
             self.renderer_error = f'{type(exc).__name__}: {exc}'
 
@@ -225,12 +294,32 @@ class World:
         self.robots = {rid: Robot(rid) for rid in ('jipai', 'pepper', 'tea')}
         self.seq = {}
         self.ledger = {}
-        self.lock = threading.RLock()
+        self.lock = threading.RLock()  # Serializes lease transfers, never physics/render.
+        self.ledger_lock = threading.Lock()
+        self.telemetry_lock = threading.Lock()
+        self.events = deque(maxlen=200)
+        self.metrics = {}
+        self.observations = {}
+        self.event_seq = 0
         self.stop = threading.Event()
-        self.thread = None
+        self.threads = []
         self.error = None
 
+    def record_event(self, kind, worker=None, robot=None, reason=None, now=None, **details):
+        with self.telemetry_lock:
+            self.event_seq += 1
+            self.events.append(dict(id=self.event_seq, type=kind, worker_id=worker,
+                                    robot_id=robot, reason=reason,
+                                    timestamp_ms=int((time.time() if now is None else now) * 1000), **details))
+
     def command(self, worker, cmd, now=None):
+        error = self._command(worker, cmd, now)
+        if error or cmd.get('type') != 'control':
+            self.record_event('rejected' if error else cmd.get('type'), worker,
+                              cmd.get('robot_id'), error, now)
+        return error
+
+    def _command(self, worker, cmd, now=None):
         now = time.time() if now is None else now
         with self.lock:
             seq = cmd.get('seq')
@@ -245,115 +334,171 @@ class World:
             robot = self.robots.get(cmd.get('robot_id'))
             if robot is None:
                 return 'unknown_robot'
-            lease = robot.lease
-            kind = cmd.get('type')
-            if kind == 'claim':
-                if lease.owner not in (None, worker):
-                    return 'robot_busy'
+            if cmd.get('type') == 'claim':
+                with robot.lock:
+                    if robot.lease.owner not in (None, worker):
+                        return 'robot_busy'
                 for other in self.robots.values():
-                    if other.id != robot.id and other.lease.owner == worker:
-                        other.hold('switched_robot')
-                        other.lease.owner = None
-                if lease.owner is None:
-                    lease.owner = worker
-                    robot.hold('activation_required')
-                lease.last_input = now
+                    with other.lock:
+                        if other.id != robot.id and other.lease.owner == worker:
+                            other.hold('switched_robot')
+                            other.lease.owner = None
+                with robot.lock:
+                    if robot.lease.owner is None:
+                        robot.lease.owner = worker
+                        robot.hold('activation_required')
+                    robot.lease.last_input = now
                 return None
-            if lease.owner != worker:
+            with robot.lock:
+                return self._robot_command(robot, worker, cmd, now)
+
+    def _robot_command(self, robot, worker, cmd, now):
+        lease = robot.lease
+        kind = cmd.get('type')
+        if kind == 'next_order':
+            if lease.owner not in (None, worker):
                 return 'lease_required'
-            if kind == 'activate':
-                if self.error:
-                    return 'simulation_unavailable'
-                lease.active = True
-                lease.hold_reason = None
-                lease.last_input = now
-            elif kind == 'hold':
-                robot.hold('operator_hold')
-            elif kind == 'release':
-                robot.hold('released')
-                lease.owner = None
-            elif kind == 'control':
-                if not lease.active:
-                    return 'activation_required'
-                for axis in ('x', 'y'):
-                    value = cmd.get(axis, 0)
-                    if type(value) not in (float, int) or not math.isfinite(value) or not -1 <= value <= 1:
-                        robot.hold('invalid_control')
-                        return 'invalid_control'
-                action = cmd.get('action')
-                if action is not None and action != robot.stage:
-                    return 'wrong_stage'
-                for flag in ('pinch', 'shake'):
-                    if flag in cmd and type(cmd[flag]) is not bool:
-                        return 'invalid_control'
-                lease.last_input = now
-                robot.velocity[:] = [cmd.get('x', 0), cmd.get('y', 0)]
-                # Gestures request the next bounded shared-autonomy step.
-                if not action and ((cmd.get('pinch') and robot.stage in ('pick', 'bag', 'deliver', 'attach', 'cook', 'retrieve', 'tray')) or (cmd.get('shake') and robot.stage == 'season')):
-                    action = robot.stage
-                if action and robot.action is None:
-                    robot.action, robot.phase, robot.dwell = action, 0, 0
-                    robot.velocity[:] = 0
-            else:
-                return 'unknown_command'
+            if not robot.delivered:
+                return 'order_not_complete'
+            robot.next_order()
             return None
+        if lease.owner != worker:
+            return 'lease_required'
+        if kind == 'activate':
+            if robot.error:
+                return 'simulation_unavailable'
+            lease.active = True
+            lease.hold_reason = None
+            lease.last_input = now
+        elif kind == 'hold':
+            robot.hold('operator_hold')
+        elif kind == 'release':
+            robot.hold('released')
+            lease.owner = None
+        elif kind == 'control':
+            if not lease.active:
+                return 'activation_required'
+            if 'frame_timestamp' in cmd:
+                stamp = cmd['frame_timestamp']
+                with robot.frame_lock:
+                    latest = robot.frame_timestamp
+                if (type(stamp) not in (int, float) or not math.isfinite(stamp)
+                        or stamp <= 0 or stamp > latest or not 0 <= now * 1000 - stamp <= 1000):
+                    robot.hold('stale_frame')
+                    return 'stale_frame'
+            for axis in ('x', 'y'):
+                value = cmd.get(axis, 0)
+                if type(value) not in (float, int) or not math.isfinite(value) or not -1 <= value <= 1:
+                    robot.hold('invalid_control')
+                    return 'invalid_control'
+            action = cmd.get('action')
+            if action is not None and (action != robot.stage or action == 'complete'):
+                return 'wrong_stage'
+            for flag in ('pinch', 'shake'):
+                if flag in cmd and type(cmd[flag]) is not bool:
+                    robot.hold('invalid_control')
+                    return 'invalid_control'
+            lease.last_input = now
+            pinch = cmd.get('pinch', False)
+            pinch_edge = pinch and not robot.pinched
+            robot.pinched = pinch
+            if not action and ((pinch_edge and robot.stage in ('pick', 'bag', 'deliver', 'attach', 'cook', 'retrieve', 'tray')) or (cmd.get('shake') and robot.stage == 'season')):
+                action = robot.stage
+            if action and robot.action is None:
+                robot.action, robot.phase, robot.dwell = action, 0, 0
+            elif robot.action is None and not robot.delivered:
+                robot.target[:] = [cmd.get('x', 0) * .65, cmd.get('y', 0) * .48]
+        else:
+            return 'unknown_command'
+        return None
 
     def disconnect(self, worker, release=True, reason='disconnected'):
         with self.lock:
             for robot in self.robots.values():
-                if robot.lease.owner == worker:
-                    robot.hold(reason)
-                    if release:
-                        robot.lease.owner = None
+                with robot.lock:
+                    if robot.lease.owner == worker:
+                        robot.hold(reason)
+                        self.record_event('hold', worker, robot.id, reason)
+                        if release:
+                            robot.lease.owner = None
+
+    def tick_robot(self, robot, now=None):
+        now = time.time() if now is None else now
+        with robot.lock:
+            # These counters measure sampled elapsed wall time while a worker
+            # owns a lease: manual REMOTE time versus autonomy/held waiting.
+            previous = self.observations.get(robot.id)
+            if previous:
+                stamp, owner, status = previous
+                if owner:
+                    with self.telemetry_lock:
+                        metrics = self.metrics.setdefault(owner, {'worker_id': owner, 'intervention_seconds': 0.0, 'wait_seconds': 0.0})
+                        key = 'intervention_seconds' if status == 'REMOTE' else 'wait_seconds'
+                        metrics[key] += max(0, now - stamp)
+            if robot.lease.active and now - robot.lease.last_input > .75:
+                robot.hold('input_timeout')
+                self.record_event('hold', robot.lease.owner, robot.id, 'input_timeout', now)
+            if robot.lease.owner and not robot.lease.active and now - robot.lease.last_input > 15:
+                self.record_event('release', robot.lease.owner, robot.id, 'lease_expired', now)
+                robot.hold('lease_expired')
+                robot.lease.owner = None
+            robot.step(.005)
+            self.observations[robot.id] = (now, robot.lease.owner, robot.status)
+            if robot.delivered:
+                with self.ledger_lock:
+                    is_new = robot.order_id not in self.ledger
+                    self.ledger.setdefault(robot.order_id, {'id': f'credit-{robot.order_id}', 'order_id': robot.order_id, 'robot_id': robot.id, 'worker_id': robot.lease.owner, 'amount': 12, 'currency': 'TEST', 'verified': True})
+                    if is_new:
+                        self.record_event('verified_reward', robot.lease.owner, robot.id, now=now, order_id=robot.order_id, amount=12, currency='TEST')
 
     def tick(self, now=None):
-        now = time.time() if now is None else now
-        with self.lock:
-            for robot in self.robots.values():
-                if robot.lease.active and now - robot.lease.last_input > .75:
-                    robot.hold('input_timeout')
-                robot.step(.005)
-                if robot.delivered:
-                    order_id = f'order-{robot.id}'
-                    self.ledger.setdefault(order_id, {'id': f'credit-{order_id}', 'order_id': order_id, 'robot_id': robot.id, 'amount': 12, 'currency': 'TEST', 'verified': True})
+        for robot in self.robots.values():
+            self.tick_robot(robot, now)
 
     def state(self):
-        with self.lock:
-            robots = []
-            orders = []
-            for robot in self.robots.values():
-                robots.append({'id': robot.id, 'name': {'jipai': 'Hot Star Jipai', 'pepper': 'Pepper Bun', 'tea': 'Bubble Tea'}[robot.id], 'status': 'active' if robot.lease.active else 'held' if robot.lease.owner else 'available', 'owner': robot.lease.owner, 'active': robot.lease.active, 'stage': robot.stage, 'action': robot.action, 'hold_reason': robot.lease.hold_reason, 'position': robot.data.mocap_pos[robot.gripper].tolist(), 'food_position': robot.food.tolist(), 'grasped': bool(robot.data.eq_active[0]), 'seasoned': robot.seasoned, 'cooked': robot.cooked, 'cook_time': robot.cook_time, 'attached': robot.attached, 'trayed': robot.trayed, 'bagged': robot.bagged, 'delivered': robot.delivered, 'simulation_time': robot.data.time, 'camera_error': robot.renderer_error, 'cameras': {view: f'/api/robots/{robot.id}/frame?view={view}' for view in ('first_person', 'top', 'wrist')}})
-                orders.append({'id': f'order-{robot.id}', 'robot_id': robot.id, 'item': {'jipai': 'Taiwanese fried chicken', 'pepper': 'Oven pepper bun', 'tea': 'Lidded bubble tea'}[robot.id], 'status': 'completed' if robot.delivered else 'in_progress', 'stage': robot.stage, 'test_credit': 12})
-            return {'robots': robots, 'orders': orders, 'ledger': list(self.ledger.values()), 'server_time': int(time.time() * 1000), 'simulation': 'MuJoCo', 'simulation_error': self.error, 'test_mode': True}
+        robots, orders = [], []
+        for robot in self.robots.values():
+            with robot.lock:
+                robots.append({'id': robot.id, 'name': {'jipai': 'Hot Star Jipai', 'pepper': 'Pepper Bun', 'tea': 'Bubble Tea'}[robot.id], 'status': robot.status, 'owner': robot.lease.owner, 'active': robot.lease.active, 'stage': robot.stage, 'action': robot.action, 'hold_reason': robot.lease.hold_reason, 'position': robot.data.mocap_pos[robot.gripper].tolist(), 'food_position': robot.food.tolist(), 'grasped': bool(robot.data.eq_active[0]), 'seasoned': robot.seasoned, 'cooked': robot.cooked, 'cook_time': robot.cook_time, 'attached': robot.attached, 'trayed': robot.trayed, 'bagged': robot.bagged, 'delivered': robot.delivered, 'simulation_time': robot.data.time, 'camera_error': robot.renderer_error, 'simulation_error': robot.error, 'frame_timestamp': robot.frame_timestamp, 'cameras': {view: f'/api/robots/{robot.id}/frame?view={view}' for view in ('first_person', 'top', 'wrist')}})
+                orders.append({'id': robot.order_id, 'robot_id': robot.id, 'item': {'jipai': 'Taiwanese fried chicken', 'pepper': 'Oven pepper bun', 'tea': 'Lidded bubble tea'}[robot.id], 'status': 'completed' if robot.delivered else 'in_progress', 'stage': robot.stage, 'test_credit': 12})
+        with self.ledger_lock:
+            ledger = list(self.ledger.values())
+        with self.telemetry_lock:
+            events = list(self.events)
+            metrics = {worker: dict(value) for worker, value in self.metrics.items()}
+        return {'robots': robots, 'orders': orders, 'ledger': ledger, 'events': events, 'metrics': metrics, 'server_time': int(time.time() * 1000), 'simulation': 'MuJoCo', 'simulation_error': self.error, 'test_mode': True}
 
     def start(self):
-        self.thread = threading.Thread(target=self.run, name='mujoco-worker', daemon=True)
-        self.thread.start()
+        if self.threads:
+            return
+        for robot in self.robots.values():
+            for target, name in ((self.run_robot, 'physics'), (self.run_renderer, 'camera')):
+                thread = threading.Thread(target=target, args=(robot,), name=f'{robot.id}-{name}', daemon=True)
+                self.threads.append(thread)
+                thread.start()
 
-    def run(self):
-        last_render = 0
+    def run_robot(self, robot):
         try:
             while not self.stop.is_set():
                 start = time.monotonic()
-                for _ in range(4):
-                    self.tick()
-                if start - last_render > .25:
-                    with self.lock:
-                        for robot in self.robots.values():
-                            robot.render()
-                    last_render = start
-                self.stop.wait(max(0, .02 - (time.monotonic() - start)))
+                self.tick_robot(robot)
+                self.stop.wait(max(0, .005 - (time.monotonic() - start)))
         except Exception as exc:
-            with self.lock:
-                self.error = f'{type(exc).__name__}: {exc}'
-                for robot in self.robots.values():
-                    robot.hold('simulation_error')
+            with robot.lock:
+                robot.error = f'{type(exc).__name__}: {exc}'
+                robot.hold('simulation_error')
+
+    def run_renderer(self, robot):
+        try:
+            while not self.stop.is_set():
+                start = time.monotonic()
+                robot.render()
+                self.stop.wait(max(0, .25 - (time.monotonic() - start)))
         finally:
-            for robot in self.robots.values():
-                if robot.renderer:
-                    robot.renderer.close()
+            if robot.renderer:
+                robot.renderer.close()
 
     def close(self):
         self.stop.set()
-        if self.thread:
-            self.thread.join(timeout=5)
+        for thread in self.threads:
+            thread.join(timeout=5)
