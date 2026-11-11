@@ -2,10 +2,17 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 export type MarketStallId = 'jipai' | 'pepper-bun' | 'bubble-tea';
+export interface MarketOrder {
+  robot_id: string;
+  stage: string;
+  delivered: boolean;
+  order_id: string;
+}
 export interface MarketEnvironment {
   group: THREE.Group;
   stalls: Record<MarketStallId, { position: THREE.Vector3; approach: THREE.Vector3; counter: THREE.Vector3 }>;
   update: (elapsedSeconds: number) => void;
+  setOrders?: (orders: readonly MarketOrder[]) => void;
   dispose: () => void;
 }
 
@@ -196,6 +203,17 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
   sign(group, '夜市', 'NIGHT SHIFT · TAIWAN', -7.1, 3.2, -0.8, 1.05, 1.65, '#29494c', '#f9d794');
   for (const x of [-2, 2]) { const board = box(group, x, 0.52, -0.1, 0.55, 0.95, 0.07, '#8b6349'); board.rotation.x = -0.12; sign(group, x < 0 ? '現炸' : '手作', '歡迎光臨', x, 0.58, 0.0, 0.46, 0.65, '#283e3c', '#e8d49d'); }
 
+  // Crates, take-away packaging and TEST cash trays stay outside approach points.
+  for (const s of specs) {
+    box(group, s.x + 1.28, 1.16, -2.05, 0.34, 0.055, 0.24, '#38494b');
+    for (let j = 0; j < 4; j++) {
+      box(group, s.x + 1.25, 1.2 + j * 0.012, -2.05, 0.16, 0.008, 0.075, '#9ba77b');
+      box(group, s.x + 0.86, 1.17 + j * 0.055, -2.48, 0.26, 0.05, 0.22, '#e3c995');
+    }
+    sign(group, '取餐', 'PICK UP · TEST', s.x + 1.2, 1.53, -1.73, 0.5, 0.3, '#29494c');
+    box(group, s.x - 1.35, 0.25, -3.7, 0.46, 0.5, 0.46, '#406258');
+  }
+
   // Batch static geometry by material; retain steam and swinging lantern roots.
   // Geometry is baked in world space because this factory is attached at the origin.
   group.updateMatrixWorld(true);
@@ -229,11 +247,89 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
     batch.meshes.forEach(object => { object.removeFromParent(); object.geometry.dispose(); geometries.delete(object.geometry); });
   }
 
+  // Eight instanced body-part draws for the entire crowd. Reuse geometry/materials;
+  // add after static batching so animated instance matrices are never baked away.
+  const crowdCount = 36; // 20 walkers, 9 queued customers, 4 diners, 3 vendors.
+  const humanBox = new THREE.BoxGeometry(1, 1, 1);
+  const humanHead = new THREE.SphereGeometry(1, 8, 6);
+  geometries.add(humanBox); geometries.add(humanHead);
+  const crowdMat = material('#ffffff');
+  const parts = Array.from({ length: 8 }, (_, part) => {
+    const instances = new THREE.InstancedMesh(part === 1 ? humanHead : humanBox, crowdMat, crowdCount);
+    instances.name = `market-crowd-part-${part}`;
+    instances.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    instances.frustumCulled = false; // Bounds change as pedestrians cross the street.
+    instances.castShadow = part < 6; instances.receiveShadow = true; group.add(instances);
+    return instances;
+  });
+  const shirts = ['#d88858', '#518e8a', '#e5b95d', '#758cb0', '#b76873', '#d6c8a7'];
+  for (let i = 0; i < crowdCount; i++) parts.forEach((part, n) => part.setColorAt(i, new THREE.Color(
+    n === 1 || n === 4 || n === 5 ? ['#d6a079', '#bc886a', '#e8b98f'][i % 3]
+      : n === 2 || n === 3 ? '#303949' : n === 6 ? '#292935' : n === 7 ? '#d5b988' : shirts[i % shirts.length],
+  )));
+  const transform = new THREE.Object3D();
+  const queues = specs.map(() => ({ completed: '', rotation: 0, departedAt: -100, stage: 'pick' }));
+  let crowdTime = 0;
+  const drawPerson = (i: number, x: number, z: number, facing: number, walk: number, seated: boolean, gesture: number, bag: boolean) => {
+    const bob = seated ? -0.39 : Math.abs(Math.sin(walk)) * 0.025;
+    const local = (part: number, px: number, py: number, pz: number, sx: number, sy: number, sz: number, tilt = 0) => {
+      transform.position.set(x + Math.cos(facing) * px + Math.sin(facing) * pz, py + bob, z - Math.sin(facing) * px + Math.cos(facing) * pz);
+      transform.rotation.set(0, facing, 0); transform.rotateX(tilt); transform.scale.set(sx, sy, sz); transform.updateMatrix(); parts[part].setMatrixAt(i, transform.matrix);
+    };
+    local(0, 0, 1.05, 0, 0.37, 0.5, 0.23);
+    local(1, 0, 1.49, 0, 0.15, 0.18, 0.14);
+    local(6, 0, 1.62, -0.01, 0.28, 0.08, 0.26);
+    for (const side of [-1, 1]) {
+      local(side < 0 ? 2 : 3, side * 0.1, 0.45, seated ? 0.15 : 0, 0.13, 0.72, 0.15, seated ? -1.1 : Math.sin(walk) * side * 0.4);
+      local(side < 0 ? 4 : 5, side * 0.25, 1.01, gesture ? 0.17 : 0, 0.1, 0.43, 0.11, gesture ? -gesture : -Math.sin(walk) * side * 0.35);
+    }
+    local(7, 0.27, 0.74, 0.21, bag ? 0.23 : 0, bag ? 0.27 : 0, bag ? 0.15 : 0);
+  };
+  const updateCrowd = (seconds: number) => {
+    crowdTime = seconds;
+    for (let i = 0; i < 20; i++) {
+      const direction = i % 2 ? 1 : -1;
+      const progress = ((seconds * (0.35 + i % 4 * 0.055) + i * 1.77) % 21 + 21) % 21;
+      drawPerson(i, direction * (progress - 10.5), 3.4 + (i % 4) * 0.85, direction * Math.PI / 2, seconds * 4 + i, false, 0, i % 3 === 0);
+    }
+    for (let stall = 0; stall < 3; stall++) {
+      const q = queues[stall]; const progress = Math.min(1, Math.max(0, (seconds - q.departedAt) / 4));
+      for (let person = 0; person < 3; person++) {
+        const slot = (person - q.rotation + 3) % 3;
+        const departing = slot === 2 && progress < 1;
+        const x = specs[stall].x + 0.68 + (departing ? progress * 2.0 : Math.sin(seconds + person) * 0.025);
+        const z = departing ? -0.8 + progress * 3.6 : -0.8 + slot * 0.82 + (1 - progress) * 0.82;
+        drawPerson(20 + stall * 3 + person, x, z, departing ? Math.PI / 3 : Math.PI, departing ? seconds * 5 : 0, false,
+          slot === 0 ? 0.8 + Math.sin(seconds * 2) * 0.12 : 0.15, departing);
+      }
+    }
+    for (let i = 0; i < 4; i++) {
+      const x = i < 2 ? -7.1 : 7.1; const second = i % 2;
+      drawPerson(29 + i, x + (second ? 0.4 : -0.65), second ? 2.2 : 1.7, second ? Math.PI : Math.PI / 2, 0, true, 1.0 + Math.sin(seconds * 1.7 + i) * 0.2, false);
+    }
+    for (let i = 0; i < 3; i++) drawPerson(33 + i, specs[i].x + 0.2, -3.25, 0, 0, false,
+      (queues[i].stage === 'bag' || queues[i].stage === 'deliver' ? 1.2 : 0.7) + Math.sin(seconds * 3 + i) * 0.3, false);
+    parts.forEach(part => { part.instanceMatrix.needsUpdate = true; });
+  };
+  updateCrowd(0);
+
   let disposed = false;
   return {
     group, stalls,
+    setOrders(orders) {
+      if (disposed) return;
+      for (const order of orders) {
+        const index = order.robot_id === 'jipai' ? 0 : ['pepper', 'pepper-bun'].includes(order.robot_id) ? 1 : ['tea', 'bubble-tea'].includes(order.robot_id) ? 2 : -1;
+        if (index < 0) continue;
+        const q = queues[index]; q.stage = order.stage;
+        if (order.delivered && order.order_id && q.completed !== order.order_id) {
+          q.completed = order.order_id; q.rotation = (q.rotation + 1) % 3; q.departedAt = crowdTime;
+        }
+      }
+    },
     update(elapsedSeconds) {
       if (disposed) return;
+      updateCrowd(elapsedSeconds);
       for (let i = 0; i < steam.length; i++) {
         const puff = steam[i]; const phase = (elapsedSeconds * 0.24 + Number(puff.userData.phase)) % 1;
         const origin = puff.userData.origin as THREE.Vector3;
@@ -242,7 +338,7 @@ export function buildMarketEnvironment(scene: THREE.Scene): MarketEnvironment {
       }
       for (let i = 0; i < lamps.length; i++) lamps[i].rotation.z = Math.sin(elapsedSeconds * 0.8 + i * 0.7) * 0.025;
     },
-    dispose() { if (disposed) return; disposed = true; group.removeFromParent(); geometries.forEach(g => g.dispose()); materials.forEach(m => m.dispose()); textures.forEach(t => t.dispose()); },
+    dispose() { if (disposed) return; disposed = true; group.removeFromParent(); parts.forEach(part => part.dispose()); geometries.forEach(g => g.dispose()); materials.forEach(m => m.dispose()); textures.forEach(t => t.dispose()); },
   };
 }
 
