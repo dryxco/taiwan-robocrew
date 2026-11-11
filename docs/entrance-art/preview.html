@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Night Shift entrance cutout preview</title>
+<style>
+  body { margin: 0; padding: 24px; background: #222; color: white; font: 16px system-ui; }
+  main { display: grid; grid-template-columns: repeat(auto-fit,minmax(300px,1fr)); gap: 20px; }
+  figure { margin: 0; border-radius: 20px; overflow: hidden; }
+  figcaption { padding: 14px; background: #333; color: white; }
+  img { display: block; width: 100%; height: auto; }
+  .dark { background: #10191b; }
+  .light { background: #f6edda; }
+  .check { background: repeating-conic-gradient(#bbb 0% 25%, #eee 0% 50%) 50% / 24px 24px; }
+</style>
+<h1>Night Shift entrance cutout</h1>
+<main>
+  <figure class="dark"><figcaption>Dark entrance background</figcaption><img src="../../public/assets/entrance-chef.png" alt="G1 chef and Taiwanese customer posing with peace signs"></figure>
+  <figure class="light"><figcaption>Warm light background</figcaption><img src="../../public/assets/entrance-chef.png" alt="Same cutout on cream"></figure>
+  <figure class="check"><figcaption>Transparency checker</figcaption><img src="../../public/assets/entrance-chef.png" alt="Same cutout on checkerboard"></figure>
+</main>
+</html>
