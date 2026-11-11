@@ -1,0 +1,17 @@
+{
+  "name": "Night Shift Taiwanese market",
+  "format": "procedural-threejs-typescript",
+  "entry": "src/scene/marketEnvironment.ts",
+  "factory": "buildMarketEnvironment(scene)",
+  "provenance": "Original procedural geometry; no third-party meshes or textures included",
+  "units": "metres",
+  "up": "+Y",
+  "stallFront": "+Z",
+  "stalls": [
+    { "id": "jipai", "name": "艋舺大雞排", "position": [-4, 0, -3] },
+    { "id": "pepper-bun", "name": "炭烤胡椒餅", "position": [0, 0, -3] },
+    { "id": "bubble-tea", "name": "島嶼珍珠奶茶", "position": [4, 0, -3] }
+  ],
+  "recommendedCamera": [0, 1.65, 5.5],
+  "robocasaAssetsIncluded": false
+}
